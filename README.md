@@ -58,6 +58,41 @@ pytest                 # 运行测试
 完成，并由进程级锁串行化读写：原文、校时依据、分析供数同次生效，
 查询和（崩溃后的）重启都不会看到半次重算的中间态。
 
+## 潮位无损分块压缩
+
+密集采样使潮位占用大量数据卷空间。可对指定开机段启用**无损分块存储**：
+
+- 压缩段的潮位原值不再存于 `observations`，而是按段归集到压缩块：
+  每块**至多 256 条**，条目为 `[obs_id, tide_level]`，先以 JSON 编码
+  （浮点逐位可逆）再经 **zlib 无损压缩**落库；`observations` 只保留
+  `block_id` 块引用且 `tide_level` 为 NULL。
+- 启用后该段**后续收到的潮位也按块保存**，自动追加进未满块，写满新建。
+- 同 ID 改值或跨段覆盖后，块内原值同步更正，详情 `/observations/{id}`
+  与供数 `/tide-levels` 都返回新值；跨段时原值从旧块移除、按新段形态落位。
+- **按需解压**：查单条、查 UTC 短窗、更正单条时只解压涉及的块
+  （同一次请求内同一块最多解压一次）；**补登校时点完全不解压潮位**，
+  仍只更新观测的 UTC、状态与跨段冲突。
+- 普通段与压缩段可在同一库内长期**混存**，重启后依旧混查；旧 SQLite 卷
+  首次打开时自动迁移（新增块引用列、数据逐列保留），接口字段与回执规则不变。
+- 启用压缩或提交批次失败时，事务整体回滚：原值、块引用与供数均保持
+  提交前状态。
+
+### `POST /segments/{boot_segment}/compression` — 启用段压缩
+
+无请求体。响应给出当次转入压缩块的观测数 `compressed_count`：
+
+```json
+{
+  "boot_segment": "boot-1",
+  "compression_enabled": true,
+  "compressed_count": 300,
+  "block_count": 2,
+  "max_entries_per_block": 256
+}
+```
+
+接口幂等：对已启用的段再次调用时 `compressed_count` 为 0。
+
 ## API
 
 均可在 `/docs` 中直接调用。
@@ -123,10 +158,12 @@ pytest                 # 运行测试
 ```
 app/
   main.py   # FastAPI 路由与请求/响应模型
-  core.py   # 校时换算、批量写入、重算、冲突检测、变更快照
-  db.py     # SQLite 连接、模式、事务与锁
+  core.py   # 校时换算、批量写入、重算、冲突检测、压缩开关与变更快照
+  blocks.py # 潮位块的 zlib 无损编解码、按需解压与块内增删改
+  db.py     # SQLite 连接、模式、旧卷迁移、事务与锁
 tests/
-  test_api.py
+  test_api.py          # 原有接口行为
+  test_compression.py  # 分块压缩、按需解压、回滚、迁移与重启混查
 Dockerfile
 docker-compose.yml
 ```

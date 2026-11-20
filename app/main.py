@@ -15,7 +15,7 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from . import core, db
+from . import blocks, core, db
 
 app = FastAPI(
     title="单浮标潮位校时服务",
@@ -45,6 +45,20 @@ class CalibrationIn(BaseModel):
 
 class CalibrationBatch(BaseModel):
     calibrations: list[CalibrationIn] = Field(min_length=1)
+
+
+class CompressionRequest(BaseModel):
+    boot_segment: str = Field(min_length=1, description="要启用无损分块存储的开机段")
+
+
+class CompressionResult(BaseModel):
+    boot_segment: str
+    compression_enabled: bool = Field(description="是否已启用分块压缩存储")
+    compressed_count: int = Field(
+        description="当次转入压缩块的观测数（已启用时再次调用为 0）"
+    )
+    block_count: int = Field(description="该开机段当前的压缩块数")
+    max_entries_per_block: int = Field(description="每块观测数上限")
 
 
 class ChangedState(BaseModel):
@@ -137,26 +151,64 @@ def submit_calibrations(batch: CalibrationBatch) -> BatchResult:
 
 # ---------------------------------------------------------------- 查询
 
+@app.post(
+    "/segments/{boot_segment}/compression",
+    response_model=CompressionResult,
+    summary="为开机段启用潮位无损分块存储",
+)
+def enable_segment_compression(boot_segment: str) -> CompressionResult:
+    """把该开机段的普通潮位观测无损压入分块（每块至多 256 条）。
+
+    压缩后潮位原值只存于块内，observations 仅保留块引用；该段后续
+    收到的潮位也按块保存。响应的 compressed_count 为当次转入压缩块
+    的观测数。接口幂等：已启用的段再次调用返回 compressed_count=0。
+    整个动作在单个事务内完成，失败则原值、块引用与供数均保持
+    提交前状态。
+    """
+    conn = db.get_conn()
+    with db.lock():
+        with db.transaction(conn):
+            moved = core.enable_compression(conn, boot_segment)
+            block_count = conn.execute(
+                "SELECT COUNT(*) AS n FROM tide_blocks WHERE boot_segment = ?",
+                (boot_segment,),
+            ).fetchone()["n"]
+    return CompressionResult(
+        boot_segment=boot_segment,
+        compression_enabled=True,
+        compressed_count=moved,
+        block_count=block_count,
+        max_entries_per_block=blocks.MAX_ENTRIES_PER_BLOCK,
+    )
+
+
 @app.get("/tide-levels", response_model=TideQueryResult, summary="按 UTC 范围查可用潮位")
 def tide_levels(
     start_ms: int = Query(ge=0, description="起始 UTC 毫秒（含）"),
     end_ms: int = Query(ge=0, description="结束 UTC 毫秒（含）"),
 ) -> TideQueryResult:
-    """只返回已校时且无冲突（status=ok）的观测，按 UTC 毫秒升序。"""
+    """只返回已校时且无冲突（status=ok）的观测，按 UTC 毫秒升序。
+
+    压缩段观测的潮位原值在块内：仅窗口内命中的块会被解压，
+    普通观测直接读列，两种形态混存时一并返回。
+    """
     if end_ms < start_ms:
         raise HTTPException(status_code=422, detail="end_ms 不得小于 start_ms")
     conn = db.get_conn()
     with db.lock():
         rows = conn.execute(
-            "SELECT obs_id, utc_ms, tide_level FROM observations "
+            "SELECT obs_id, utc_ms, tide_level, block_id FROM observations "
             "WHERE status = ? AND utc_ms BETWEEN ? AND ? "
             "ORDER BY utc_ms, obs_id",
             (core.OK, start_ms, end_ms),
         ).fetchall()
-    items = [
-        TidePoint(obs_id=r["obs_id"], utc_ms=r["utc_ms"], tide_level=r["tide_level"])
-        for r in rows
-    ]
+        reader = blocks.BlockReader(conn)
+        items = []
+        pending_refs = [(r["obs_id"], r["block_id"]) for r in rows if r["block_id"] is not None]
+        levels = reader.levels_for(pending_refs)
+        for r in rows:
+            tide = r["tide_level"] if r["block_id"] is None else levels[r["obs_id"]]
+            items.append(TidePoint(obs_id=r["obs_id"], utc_ms=r["utc_ms"], tide_level=tide))
     return TideQueryResult(count=len(items), items=items)
 
 
@@ -171,8 +223,15 @@ def get_observation(obs_id: str) -> ObservationDetail:
         row = conn.execute(
             "SELECT * FROM observations WHERE obs_id = ?", (obs_id,)
         ).fetchone()
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"观测 '{obs_id}' 不存在")
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"观测 '{obs_id}' 不存在")
+        # 压缩段：潮位原值只在块内，单条查询只解压涉及的块
+        if row["block_id"] is not None:
+            tide_level = blocks.BlockReader(conn).tide_level(
+                row["block_id"], obs_id
+            )
+        else:
+            tide_level = row["tide_level"]
     calibration = None
     if row["cal_lo_counter"] is not None:
         calibration = CalibrationBasis(
@@ -187,7 +246,7 @@ def get_observation(obs_id: str) -> ObservationDetail:
         obs_id=row["obs_id"],
         boot_segment=row["boot_segment"],
         counter=row["counter"],
-        tide_level=row["tide_level"],
+        tide_level=tide_level,
         utc_ms=row["utc_ms"],
         status=row["status"],
         reason=row["reason"],

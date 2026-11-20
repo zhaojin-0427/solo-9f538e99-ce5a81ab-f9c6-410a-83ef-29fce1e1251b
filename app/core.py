@@ -15,9 +15,71 @@ import bisect
 import sqlite3
 from typing import Iterable
 
+from . import blocks
+
 OK = "ok"
 PENDING = "pending_calibration"
 CONFLICT = "conflict"
+
+
+# ---------------------------------------------------------------- 分块压缩开关
+
+def is_compressed(conn: sqlite3.Connection, segment: str) -> bool:
+    """该开机段是否已启用无损分块存储。"""
+    row = conn.execute(
+        "SELECT 1 FROM segment_settings "
+        "WHERE boot_segment = ? AND compression_enabled = 1",
+        (segment,),
+    ).fetchone()
+    return row is not None
+
+
+def enable_compression(conn: sqlite3.Connection, segment: str) -> int:
+    """为开机段启用无损分块存储，返回当次转入压缩块的观测数。
+
+    幂等：重复启用只确认开关，已在块内的观测不重复迁移，返回 0。
+    普通观测按段内计数顺序每 256 条压成一个块，随后原值从
+    observations 移除、只留 block_id 块引用。与所有写路径一样运行在
+    调用方的单事务内，任何一步失败整体回滚，原值/块引用/供数保持
+    提交前状态。
+    """
+    conn.execute(
+        "INSERT INTO segment_settings (boot_segment, compression_enabled) "
+        "VALUES (?, 1) ON CONFLICT(boot_segment) "
+        "DO UPDATE SET compression_enabled = 1",
+        (segment,),
+    )
+    rows = conn.execute(
+        "SELECT obs_id, tide_level FROM observations "
+        "WHERE boot_segment = ? AND block_id IS NULL "
+        "ORDER BY counter, obs_id",
+        (segment,),
+    ).fetchall()
+    moved = 0
+    pending: list[tuple[str, float]] = []
+    for row in rows:
+        pending.append((row["obs_id"], row["tide_level"]))
+        if len(pending) == blocks.MAX_ENTRIES_PER_BLOCK:
+            _flush_into_new_block(conn, segment, pending)
+            moved += len(pending)
+            pending = []
+    if pending:
+        _flush_into_new_block(conn, segment, pending)
+        moved += len(pending)
+    return moved
+
+
+def _flush_into_new_block(
+    conn: sqlite3.Connection, segment: str, entries: list[tuple[str, float]]
+) -> None:
+    block_id = blocks.create_block(conn, segment, entries)
+    ids = [obs_id for obs_id, _level in entries]
+    ph = ",".join("?" for _ in ids)
+    conn.execute(
+        f"UPDATE observations SET tide_level = NULL, block_id = ? "
+        f"WHERE obs_id IN ({ph})",
+        (block_id, *ids),
+    )
 
 
 # ---------------------------------------------------------------- 校时换算
@@ -183,6 +245,7 @@ def upsert_observations(conn: sqlite3.Connection, items: list[dict]) -> list[str
         return []
     segments = {it["boot_segment"] for it in items}
     points_by_seg = {s: load_points(conn, s) for s in segments}
+    compressed_segs = {s for s in segments if is_compressed(conn, s)}
     ids = [it["obs_id"] for it in items]
     id_ph = ",".join("?" for _ in ids)
 
@@ -201,6 +264,16 @@ def upsert_observations(conn: sqlite3.Connection, items: list[dict]) -> list[str
     for it in items:
         computed[it["obs_id"]] = (it, compute_utc(points_by_seg[it["boot_segment"]], it["counter"]))
 
+    # 现有观测的落位（普通列 / 压缩块），用于覆盖时原地改写或迁移
+    existing: dict[str, sqlite3.Row] = {
+        r["obs_id"]: r
+        for r in conn.execute(
+            f"SELECT obs_id, boot_segment, block_id FROM observations "
+            f"WHERE obs_id IN ({id_ph})",
+            ids,
+        )
+    }
+
     new_ms = {res[0] for _, res in computed.values() if res is not None}
     affected_ms = old_ms | new_ms
     if affected_ms:
@@ -213,37 +286,66 @@ def upsert_observations(conn: sqlite3.Connection, items: list[dict]) -> list[str
     before = _snapshot(conn, where, params)
 
     for obs_id, (it, result) in computed.items():
+        prev = existing.get(obs_id)
+        target_compressed = it["boot_segment"] in compressed_segs
+
+        # 解除旧落位：跨段覆盖或转普通存储时，把原值从旧块移走，避免残留
+        if prev is not None and prev["block_id"] is not None and (
+            not target_compressed
+            or prev["boot_segment"] != it["boot_segment"]
+        ):
+            blocks.remove_from_block(conn, prev["block_id"], obs_id)
+
+        if target_compressed:
+            # 同段同块更正只解压重写涉及块；否则追加/新建到目标段的块
+            if (
+                prev is not None
+                and prev["block_id"] is not None
+                and prev["boot_segment"] == it["boot_segment"]
+            ):
+                block_id = prev["block_id"]
+                blocks.replace_in_block(conn, block_id, obs_id, it["tide_level"])
+            else:
+                block_id = blocks.append_to_segment(
+                    conn, it["boot_segment"], obs_id, it["tide_level"]
+                )
+            tide_level = None
+        else:
+            block_id = None
+            tide_level = it["tide_level"]
+
         if result is None:
             reason = _pending_reason(it["boot_segment"], it["counter"],
                                      points_by_seg[it["boot_segment"]])
             conn.execute(
                 "INSERT INTO observations (obs_id, boot_segment, counter, tide_level, "
-                "utc_ms, status, reason) VALUES (?,?,?,?,NULL,?,?) "
+                "block_id, utc_ms, status, reason) VALUES (?,?,?,?,?,NULL,?,?) "
                 "ON CONFLICT(obs_id) DO UPDATE SET "
                 "boot_segment=excluded.boot_segment, counter=excluded.counter, "
-                "tide_level=excluded.tide_level, utc_ms=NULL, "
-                "status=excluded.status, reason=excluded.reason, "
+                "tide_level=excluded.tide_level, block_id=excluded.block_id, "
+                "utc_ms=NULL, status=excluded.status, reason=excluded.reason, "
                 "cal_lo_counter=NULL, cal_lo_utc_ms=NULL, "
                 "cal_hi_counter=NULL, cal_hi_utc_ms=NULL",
-                (it["obs_id"], it["boot_segment"], it["counter"], it["tide_level"],
-                 PENDING, reason),
+                (it["obs_id"], it["boot_segment"], it["counter"], tide_level,
+                 block_id, PENDING, reason),
             )
         else:
             utc_ms, (c_lo, t_lo), (c_hi, t_hi) = result
             conn.execute(
                 "INSERT INTO observations (obs_id, boot_segment, counter, tide_level, "
-                "utc_ms, status, reason, cal_lo_counter, cal_lo_utc_ms, "
-                "cal_hi_counter, cal_hi_utc_ms) VALUES (?,?,?,?,?,?,NULL,?,?,?,?) "
+                "block_id, utc_ms, status, reason, cal_lo_counter, cal_lo_utc_ms, "
+                "cal_hi_counter, cal_hi_utc_ms) "
+                "VALUES (?,?,?,?,?,?,?,NULL,?,?,?,?) "
                 "ON CONFLICT(obs_id) DO UPDATE SET "
                 "boot_segment=excluded.boot_segment, counter=excluded.counter, "
-                "tide_level=excluded.tide_level, utc_ms=excluded.utc_ms, "
-                "status=excluded.status, reason=NULL, "
+                "tide_level=excluded.tide_level, block_id=excluded.block_id, "
+                "utc_ms=excluded.utc_ms, status=excluded.status, reason=NULL, "
                 "cal_lo_counter=excluded.cal_lo_counter, "
                 "cal_lo_utc_ms=excluded.cal_lo_utc_ms, "
                 "cal_hi_counter=excluded.cal_hi_counter, "
                 "cal_hi_utc_ms=excluded.cal_hi_utc_ms",
-                (it["obs_id"], it["boot_segment"], it["counter"], it["tide_level"],
-                 utc_ms, OK, c_lo, t_lo, c_hi, t_hi),
+                (it["obs_id"], it["boot_segment"], it["counter"], tide_level,
+                 block_id, utc_ms, OK, c_lo, t_lo, c_hi, t_hi),
             )
 
     resolve_conflicts(conn)
